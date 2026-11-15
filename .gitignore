@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+build/
+dist/
+*.spec
+config.json
+納品物_*/
