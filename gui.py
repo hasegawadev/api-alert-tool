@@ -9,6 +9,8 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
+import webbrowser
 import customtkinter as ctk
 
 from api_client import (
@@ -16,6 +18,7 @@ from api_client import (
     evaluate_condition,
     fetch_exchange_rate,
     load_history_csv,
+    mask_urls,
     send_webhook_notification,
 )
 
@@ -47,6 +50,11 @@ LOG_PLACEHOLDER_TEXT = "ここに実行ログが表示されます..."
 CURRENCY_PAIRS = ["USD/JPY", "EUR/JPY", "GBP/JPY", "AUD/JPY"]
 CONDITION_OPTIONS = ["以下になったら通知", "以上になったら通知"]
 
+MIN_INTERVAL_SEC = 60
+MAX_INTERVAL_SEC = 86400
+DEFAULT_INTERVAL_SEC = 3600
+EXCHANGE_RATE_API_URL = "https://www.exchangerate-api.com"
+
 
 def get_base_dir() -> str:
     """実行ファイル（.exe）またはスクリプトと同階層のディレクトリを取得する。"""
@@ -63,29 +71,41 @@ class RateAlertDashboardApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__(fg_color=COLOR_BG)
         self.title("為替レート監視 ＆ Webhook自動通知ダッシュボード")
-        self.geometry("960x880")
-        self.minsize(820, 760)
+        self.geometry("960x890")
+        self.minsize(820, 770)
 
-        # スレッド・状態管理フラグ
+        # スレッド・状態管理フラグと排他ロック
         self.stop_event = threading.Event()
+        self.check_lock = threading.Lock()
         self.monitor_thread: threading.Thread | None = None
         self.single_fetch_running = False
         self.is_monitoring = False
         self.has_log_entries = False
         self.sort_reverse_map: dict[str, bool] = {}
+        self.help_dialog: ctk.CTkToplevel | None = None
 
         # 連続スパム通知防止用フラグ（一度通知したら条件が解除されるまで再通知しない）
         self.already_notified = False
         self.last_alert_key: tuple[str, float, str] | None = None
 
-        # 設定変数の初期化
+        # 設定変数の初期化（メインスレッド専用）
         self.currency_pair_var = ctk.StringVar(value="USD/JPY")
         self.target_rate_var = ctk.StringVar(value="150.00")
         self.condition_var = ctk.StringVar(value="以下になったら通知")
-        self.interval_sec_var = ctk.StringVar(value="60")
+        self.interval_sec_var = ctk.StringVar(value=str(DEFAULT_INTERVAL_SEC))
         self.webhook_url_var = ctk.StringVar(value="")
         self.show_webhook_var = ctk.BooleanVar(value=False)
         self.output_dir_var = ctk.StringVar(value=DEFAULT_OUTPUT_DIR)
+
+        # サブスレッド参照用の純粋Python設定スナップショット（Tkinter非依存）
+        self.config_snapshot: dict[str, Any] = {
+            "currency_pair": "USD/JPY",
+            "target_rate": 150.0,
+            "condition": "以下になったら通知",
+            "interval_sec": DEFAULT_INTERVAL_SEC,
+            "webhook_url": "",
+            "output_dir": DEFAULT_OUTPUT_DIR,
+        }
 
         # KPI / 進捗ステータス変数
         self.kpi_rate_var = ctk.StringVar(value="--- 円")
@@ -123,7 +143,14 @@ class RateAlertDashboardApp(ctk.CTk):
                 if data.get("condition") in CONDITION_OPTIONS:
                     self.condition_var.set(str(data["condition"]))
                 if data.get("interval_sec") is not None:
-                    self.interval_sec_var.set(str(data["interval_sec"]))
+                    try:
+                        iv = int(str(data["interval_sec"]).strip())
+                        if MIN_INTERVAL_SEC <= iv <= MAX_INTERVAL_SEC:
+                            self.interval_sec_var.set(str(iv))
+                        else:
+                            self.interval_sec_var.set(str(DEFAULT_INTERVAL_SEC))
+                    except ValueError:
+                        self.interval_sec_var.set(str(DEFAULT_INTERVAL_SEC))
                 if isinstance(data.get("webhook_url"), str):
                     self.webhook_url_var.set(data["webhook_url"])
                 if isinstance(data.get("output_dir"), str) and data["output_dir"].strip():
@@ -132,12 +159,12 @@ class RateAlertDashboardApp(ctk.CTk):
                 pass
 
     def save_config(self) -> None:
-        """現在の設定値を config.json に保存する。"""
+        """現在の設定値を config.json に保存する（メインスレッドから呼び出す）。"""
         data = {
             "currency_pair": self.currency_pair_var.get().strip() or "USD/JPY",
-            "target_rate": self.target_rate_var.get().strip() or "150.00",
+            "target_rate": self.target_rate_var.get().strip(),
             "condition": self.condition_var.get().strip() or "以下になったら通知",
-            "interval_sec": self.interval_sec_var.get().strip() or "60",
+            "interval_sec": self.interval_sec_var.get().strip(),
             "webhook_url": self.webhook_url_var.get().strip(),
             "output_dir": self.output_dir_var.get().strip() or DEFAULT_OUTPUT_DIR,
         }
@@ -239,6 +266,7 @@ class RateAlertDashboardApp(ctk.CTk):
         font_body = ctk.CTkFont(family=FONT_FAMILY, size=13)
         font_body_bold = ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")
         font_sub = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        font_footer = ctk.CTkFont(family=FONT_FAMILY, size=11, underline=True)
         font_kpi_val = ctk.CTkFont(family=FONT_FAMILY, size=22, weight="bold")
         font_kpi_lbl = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
@@ -422,7 +450,7 @@ class RateAlertDashboardApp(ctk.CTk):
 
         ctk.CTkLabel(
             pair_interval_frame,
-            text="※10〜3600秒推奨（デフォルト: 60秒）",
+            text="※60〜86400秒（デフォルト: 3600秒）",
             font=font_sub,
             text_color=COLOR_TEXT_SUB,
         ).pack(side="left")
@@ -477,7 +505,7 @@ class RateAlertDashboardApp(ctk.CTk):
             text_color=COLOR_TEXT_SUB,
         ).pack(side="left")
 
-        # 行3: Webhook URL ＆ 表示切替 ＆ テスト送信ボタン
+        # 行3: Webhook URL ＆ 表示切替 ＆ 取得方法ヘルプ ＆ テスト送信ボタン
         ctk.CTkLabel(
             settings_card,
             text="Webhook URL:",
@@ -518,12 +546,28 @@ class RateAlertDashboardApp(ctk.CTk):
             text_color=COLOR_TEXT_SUB,
             font=font_sub,
         )
-        self.show_webhook_check.grid(row=0, column=1, padx=(0, 10))
+        self.show_webhook_check.grid(row=0, column=1, padx=(0, 8))
+
+        self.webhook_help_btn = ctk.CTkButton(
+            webhook_subframe,
+            text="取得方法",
+            width=80,
+            height=32,
+            corner_radius=8,
+            font=font_sub,
+            fg_color="transparent",
+            hover_color=COLOR_GHOST_HOVER,
+            border_width=1,
+            border_color=COLOR_GHOST_BORDER,
+            text_color=COLOR_TEXT_SUB,
+            command=self.show_webhook_help_dialog,
+        )
+        self.webhook_help_btn.grid(row=0, column=2, padx=(0, 8))
 
         self.test_webhook_btn = ctk.CTkButton(
             webhook_subframe,
             text="テスト送信",
-            width=105,
+            width=100,
             height=32,
             corner_radius=8,
             font=font_body,
@@ -534,7 +578,7 @@ class RateAlertDashboardApp(ctk.CTk):
             text_color=COLOR_TEXT_MAIN,
             command=self.send_test_webhook,
         )
-        self.test_webhook_btn.grid(row=0, column=2)
+        self.test_webhook_btn.grid(row=0, column=3)
 
         # 行4: CSV出力先フォルダ
         ctk.CTkLabel(
@@ -564,7 +608,7 @@ class RateAlertDashboardApp(ctk.CTk):
         self.browse_btn = ctk.CTkButton(
             dir_subframe,
             text="参照...",
-            width=105,
+            width=100,
             height=32,
             corner_radius=8,
             font=font_body,
@@ -726,7 +770,7 @@ class RateAlertDashboardApp(ctk.CTk):
         self._configure_log_tags(is_dark=self.dark_mode_var.get())
         self._show_log_placeholder()
 
-        # --- 5. リアルタイム履歴プレビューカード（ttk.Treeview） ---
+        # --- 5. 履歴プレビューカード（ttk.Treeview） ---
         preview_card = ctk.CTkFrame(
             self,
             fg_color=COLOR_CARD_BG,
@@ -734,7 +778,7 @@ class RateAlertDashboardApp(ctk.CTk):
             border_color=COLOR_CARD_BORDER,
             corner_radius=12,
         )
-        preview_card.grid(row=5, column=0, sticky="nsew", padx=24, pady=(5, 16))
+        preview_card.grid(row=5, column=0, sticky="nsew", padx=24, pady=(5, 4))
         preview_card.grid_columnconfigure(0, weight=1)
         preview_card.grid_rowconfigure(1, weight=1)
 
@@ -825,6 +869,131 @@ class RateAlertDashboardApp(ctk.CTk):
         self.preview_tree.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
         tree_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=2)
 
+        # --- 6. 最下部：API利用規約に基づく出典表記リンク ---
+        footer_frame = ctk.CTkFrame(self, fg_color="transparent")
+        footer_frame.grid(row=6, column=0, sticky="ew", padx=24, pady=(0, 8))
+        footer_frame.grid_columnconfigure(0, weight=1)
+
+        self.attribution_label = ctk.CTkLabel(
+            footer_frame,
+            text="Rates By Exchange Rate API",
+            font=font_footer,
+            text_color=COLOR_TEXT_SUB,
+            cursor="hand2",
+        )
+        self.attribution_label.grid(row=0, column=0)
+        self.attribution_label.bind(
+            "<Button-1>",
+            lambda _event: webbrowser.open(EXCHANGE_RATE_API_URL),
+        )
+
+    def show_webhook_help_dialog(self) -> None:
+        """Discord / Slack の Webhook URL 発行手順（3ステップ）をポップアップダイアログで表示する。"""
+        if self.help_dialog is not None and self.help_dialog.winfo_exists():
+            self.help_dialog.focus_force()
+            self.help_dialog.lift()
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Webhook URL の取得方法（Discord / Slack）")
+        dlg.geometry("560x420")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.configure(fg_color=COLOR_BG)
+        self.help_dialog = dlg
+
+        font_h = ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
+        font_sub_h = ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")
+        font_txt = ctk.CTkFont(family=FONT_FAMILY, size=12)
+
+        container = ctk.CTkFrame(
+            dlg,
+            fg_color=COLOR_CARD_BG,
+            border_width=1,
+            border_color=COLOR_CARD_BORDER,
+            corner_radius=12,
+        )
+        container.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            container,
+            text="Webhook URL の発行手順（3ステップ）",
+            font=font_h,
+            text_color=COLOR_TEXT_MAIN,
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(16, 10))
+
+        # Discord 手順
+        discord_box = ctk.CTkFrame(
+            container,
+            fg_color=COLOR_INPUT_BG,
+            border_width=1,
+            border_color=COLOR_CARD_BORDER,
+            corner_radius=8,
+        )
+        discord_box.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(
+            discord_box,
+            text="■ Discord の場合",
+            font=font_sub_h,
+            text_color=COLOR_ACCENT,
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkLabel(
+            discord_box,
+            text=(
+                "1. 通知したいチャンネルの「チャンネルの編集（歯車アイコン）」を開きます。\n"
+                "2. 左メニューの「連携サービス」→「ウェブフックを作成」をクリックします。\n"
+                "3.「ウェブフックURLをコピー」を押し、本ツールの入力欄に貼り付けます。"
+            ),
+            font=font_txt,
+            text_color=COLOR_TEXT_MAIN,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(0, 10))
+
+        # Slack 手順
+        slack_box = ctk.CTkFrame(
+            container,
+            fg_color=COLOR_INPUT_BG,
+            border_width=1,
+            border_color=COLOR_CARD_BORDER,
+            corner_radius=8,
+        )
+        slack_box.pack(fill="x", padx=20, pady=(0, 14))
+        ctk.CTkLabel(
+            slack_box,
+            text="■ Slack の場合",
+            font=font_sub_h,
+            text_color=COLOR_ACCENT,
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkLabel(
+            slack_box,
+            text=(
+                "1. Slack App Directory で「Incoming WebHooks」を検索して追加します。\n"
+                "2. 通知を投稿したいチャンネルを選択して「インテグレーションの追加」を押します。\n"
+                "3. 発行された「Webhook URL (https://hooks.slack.com/...)」をコピーして貼り付けます。"
+            ),
+            font=font_txt,
+            text_color=COLOR_TEXT_MAIN,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(0, 10))
+
+        ctk.CTkButton(
+            container,
+            text="閉じる",
+            width=120,
+            height=34,
+            corner_radius=8,
+            font=font_sub_h,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="#FFFFFF",
+            command=dlg.destroy,
+        ).pack(pady=(2, 14))
+
     def _toggle_webhook_visibility(self) -> None:
         """Webhook URL入力欄の伏字（•）と平文表示を切り替える。"""
         if self.show_webhook_var.get():
@@ -903,6 +1072,8 @@ class RateAlertDashboardApp(ctk.CTk):
 
     def browse_output_dir(self) -> None:
         """出力先フォルダ選択ダイアログを開き、選択されたパスを保存する。"""
+        if self.is_monitoring:
+            return
         current_dir = self.output_dir_var.get().strip() or DEFAULT_OUTPUT_DIR
         initial_dir = current_dir if os.path.exists(current_dir) else get_base_dir()
         selected = filedialog.askdirectory(initialdir=initial_dir, title="CSV出力先フォルダを選択")
@@ -923,9 +1094,9 @@ class RateAlertDashboardApp(ctk.CTk):
 
     def _classify_log_tag(self, message: str) -> str:
         """ログメッセージの内容に応じて色分けタグ（error / warning / success / normal）を判定する。"""
-        if any(k in message for k in ("[エラー]", "失敗", "通信エラー", "入力エラー")):
+        if any(k in message for k in ("[エラー]", "失敗", "通信エラー", "入力エラー", "HTTP 429", "レート制限")):
             return "error"
-        if any(k in message for k in ("[警告]", "[停止]", "スキップ", "未設定", "停止しました")):
+        if any(k in message for k in ("[警告]", "[停止]", "スキップ", "未設定", "停止しました", "退避保存")):
             return "warning"
         if any(
             k in message
@@ -935,10 +1106,11 @@ class RateAlertDashboardApp(ctk.CTk):
         return "normal"
 
     def append_log(self, message: str) -> None:
-        """メインスレッド上で安全に実行ログエリアへ色分け付きメッセージを追記する。"""
+        """メインスレッド上で安全に実行ログエリアへ色分け付きメッセージを追記する（URLマスク処理付き）。"""
+        safe_message = mask_urls(message)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}\n"
-        tag = self._classify_log_tag(message)
+        line = f"[{timestamp}] {safe_message}\n"
+        tag = self._classify_log_tag(safe_message)
 
         def _append() -> None:
             self.log_text.configure(state="normal")
@@ -988,35 +1160,55 @@ class RateAlertDashboardApp(ctk.CTk):
 
     def validate_inputs(
         self, require_webhook: bool = False
-    ) -> tuple[str, float, str, int, str, str] | None:
+    ) -> dict[str, Any] | None:
         """
-        画面入力値を検証する。
-        不正な値がある場合は該当入力欄の枠線を赤く（#EF4444）し、
-        ステータス欄と進行状況欄にエラー理由を表示する。
+        メインスレッド上で画面入力値を検証し、純粋Python辞書（スナップショット）を返す。
+        目標レートやチェック間隔が空欄・不正値の場合は勝手にフォールバックせずエラーとして扱う。
         """
         self._reset_input_borders()
         errors: list[str] = []
 
-        currency_pair = self.currency_pair_var.get().strip() or "USD/JPY"
-        condition = self.condition_var.get().strip() or "以下になったら通知"
+        currency_pair = self.currency_pair_var.get().strip()
+        if currency_pair not in CURRENCY_PAIRS:
+            errors.append("監視通貨ペアを正しく選択してください")
 
-        target_rate = 150.0
-        try:
-            target_rate = float(self.target_rate_var.get().strip())
-            if target_rate <= 0:
-                raise ValueError
-        except ValueError:
+        condition = self.condition_var.get().strip()
+        if condition not in CONDITION_OPTIONS:
+            errors.append("判定条件を正しく選択してください")
+
+        target_rate: float | None = None
+        raw_target = self.target_rate_var.get().strip()
+        if not raw_target:
             self.target_entry.configure(border_color=COLOR_DANGER)
-            errors.append("目標レートは 0 より大きい数値（例: 150.00）で入力してください")
+            errors.append("目標レートが空欄です（0より大きい数値を入力してください）")
+        else:
+            try:
+                parsed_target = float(raw_target)
+                if parsed_target <= 0:
+                    raise ValueError
+                target_rate = parsed_target
+            except ValueError:
+                self.target_entry.configure(border_color=COLOR_DANGER)
+                errors.append("目標レートは 0 より大きい数値（例: 150.00）で入力してください")
 
-        interval_sec = 60
-        try:
-            interval_sec = int(self.interval_sec_var.get().strip())
-            if not (5 <= interval_sec <= 86400):
-                raise ValueError
-        except ValueError:
+        interval_sec: int | None = None
+        raw_interval = self.interval_sec_var.get().strip()
+        if not raw_interval:
             self.interval_entry.configure(border_color=COLOR_DANGER)
-            errors.append("チェック間隔は 5〜86400 の整数（秒）で入力してください")
+            errors.append(
+                f"チェック間隔が空欄です（{MIN_INTERVAL_SEC}〜{MAX_INTERVAL_SEC}秒で入力してください）"
+            )
+        else:
+            try:
+                parsed_interval = int(raw_interval)
+                if not (MIN_INTERVAL_SEC <= parsed_interval <= MAX_INTERVAL_SEC):
+                    raise ValueError
+                interval_sec = parsed_interval
+            except ValueError:
+                self.interval_entry.configure(border_color=COLOR_DANGER)
+                errors.append(
+                    f"チェック間隔は {MIN_INTERVAL_SEC}〜{MAX_INTERVAL_SEC} の整数（秒）で入力してください"
+                )
 
         webhook_url = self.webhook_url_var.get().strip()
         if require_webhook:
@@ -1038,20 +1230,43 @@ class RateAlertDashboardApp(ctk.CTk):
             self.dir_entry.configure(border_color=COLOR_DANGER)
             errors.append("CSV出力先フォルダパスを入力してください")
 
-        if errors:
+        if errors or target_rate is None or interval_sec is None:
             error_msg = "入力エラー: " + " / ".join(errors)
             self.update_kpi(status_text="入力エラー")
             self.progress_detail_var.set(error_msg)
             self.progress_detail_label.configure(text_color=COLOR_DANGER)
-            self.append_log(f"[エラー] {error_msg}")
+            self.append_log(f"[警告] {error_msg}（処理をスキップしました）")
             return None
 
         self.progress_detail_label.configure(text_color=COLOR_TEXT_SUB)
-        return currency_pair, target_rate, condition, interval_sec, webhook_url, output_dir
+        snapshot = {
+            "currency_pair": currency_pair,
+            "target_rate": target_rate,
+            "condition": condition,
+            "interval_sec": interval_sec,
+            "webhook_url": webhook_url,
+            "output_dir": output_dir,
+        }
+        self.config_snapshot = dict(snapshot)
+        return snapshot
+
+    def _set_settings_inputs_state(self, locked: bool) -> None:
+        """自動監視中は設定入力欄をロック（disabled）し、停止時に解除する。"""
+        combo_state = "disabled" if locked else "readonly"
+        entry_state = "disabled" if locked else "normal"
+
+        self.pair_combo.configure(state=combo_state)
+        self.interval_entry.configure(state=entry_state)
+        self.target_entry.configure(state=entry_state)
+        self.condition_menu.configure(state=entry_state)
+        self.webhook_entry.configure(state=entry_state)
+        self.dir_entry.configure(state=entry_state)
+        self.browse_btn.configure(state=entry_state)
 
     def _set_monitoring_ui(self, monitoring: bool) -> None:
-        """自動監視中かどうかに応じて開始・停止ボタンの見た目を切り替える。"""
+        """自動監視中かどうかに応じて設定入力欄のロックと開始・停止ボタンの見た目を切り替える。"""
         self.is_monitoring = monitoring
+        self._set_settings_inputs_state(locked=monitoring)
         if monitoring:
             self.start_btn.configure(state="disabled", fg_color=COLOR_START_DISABLED)
             self.stop_btn.configure(
@@ -1075,12 +1290,15 @@ class RateAlertDashboardApp(ctk.CTk):
 
     def send_test_webhook(self) -> None:
         """「テスト送信」ボタン押下時にバックグラウンドでWebhookテスト通知を送信する。"""
-        validated = self.validate_inputs(require_webhook=True)
-        if validated is None:
+        snapshot = self.validate_inputs(require_webhook=True)
+        if snapshot is None:
             return
 
-        currency_pair, target_rate, condition, _, webhook_url, _ = validated
         self.save_config()
+        currency_pair = str(snapshot["currency_pair"])
+        target_rate = float(snapshot["target_rate"])
+        condition = str(snapshot["condition"])
+        webhook_url = str(snapshot["webhook_url"])
 
         self.test_webhook_btn.configure(state="disabled", text="送信中...")
         self.append_log(f"Webhookテスト通知を送信しています... ({currency_pair})")
@@ -1110,16 +1328,21 @@ class RateAlertDashboardApp(ctk.CTk):
         """「今すぐ1回取得」ボタン押下時の単発レート取得＆判定処理。"""
         if self.single_fetch_running:
             return
-        validated = self.validate_inputs(require_webhook=False)
-        if validated is None:
+        snapshot = self.validate_inputs(require_webhook=False)
+        if snapshot is None:
             return
 
-        currency_pair, target_rate, condition, _, webhook_url, output_dir = validated
         self.save_config()
+        currency_pair = str(snapshot["currency_pair"])
+        target_rate = float(snapshot["target_rate"])
+        condition = str(snapshot["condition"])
+        webhook_url = str(snapshot["webhook_url"])
+        output_dir = str(snapshot["output_dir"])
+        is_periodic_now = bool(self.is_monitoring)
 
         self.single_fetch_running = True
         self.fetch_once_btn.configure(state="disabled", text="取得中...")
-        if not self.is_monitoring:
+        if not is_periodic_now:
             self.progress_detail_var.set(f"{currency_pair} の最新為替レートを取得中...")
 
         def _worker() -> None:
@@ -1130,7 +1353,7 @@ class RateAlertDashboardApp(ctk.CTk):
                     condition=condition,
                     webhook_url=webhook_url,
                     output_dir=output_dir,
-                    is_periodic=self.is_monitoring,
+                    is_periodic=is_periodic_now,
                 )
             finally:
                 def _restore() -> None:
@@ -1142,15 +1365,19 @@ class RateAlertDashboardApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def start_monitoring(self) -> None:
-        """「自動監視を開始」ボタン押下時の処理。バックグラウンドスレッドで定期監視を開始する。"""
+        """「自動監視を開始」ボタン押下時の処理。設定スナップショットを渡してバックグラウンド監視を開始する。"""
         if self.is_monitoring:
             return
-        validated = self.validate_inputs(require_webhook=False)
-        if validated is None:
+        snapshot = self.validate_inputs(require_webhook=False)
+        if snapshot is None:
             return
 
-        currency_pair, target_rate, condition, interval_sec, webhook_url, output_dir = validated
         self.save_config()
+        currency_pair = str(snapshot["currency_pair"])
+        target_rate = float(snapshot["target_rate"])
+        condition = str(snapshot["condition"])
+        interval_sec = int(snapshot["interval_sec"])
+        webhook_url = str(snapshot["webhook_url"])
 
         # 監視開始時にスパム防止フラグを初期化
         self.already_notified = False
@@ -1170,6 +1397,7 @@ class RateAlertDashboardApp(ctk.CTk):
 
         self.monitor_thread = threading.Thread(
             target=self._run_monitor_loop,
+            args=(dict(snapshot),),
             daemon=True,
         )
         self.monitor_thread.start()
@@ -1187,47 +1415,66 @@ class RateAlertDashboardApp(ctk.CTk):
             self.progress_detail_var.set("自動監視を停止しています...")
             self.append_log("[停止] 自動監視の停止リクエストを受け付けました。")
 
-    def _run_monitor_loop(self) -> None:
-        """バックグラウンドで指定間隔ごとに為替レートを取得し、カウントダウンを更新する。"""
+    def _run_monitor_loop(self, snapshot: dict[str, Any]) -> None:
+        """
+        バックグラウンドで指定間隔ごとに為替レートを取得し、カウントダウンを更新する。
+        Tkinter の StringVar には一切直接触れず、メインスレッドから渡された設定スナップショットを使用する。
+        """
         try:
             while not self.stop_event.is_set():
-                # 毎回最新の設定値を読み取る（監視中の条件変更にも柔軟に対応）
-                currency_pair = self.currency_pair_var.get().strip() or "USD/JPY"
-                condition = self.condition_var.get().strip() or "以下になったら通知"
-                webhook_url = self.webhook_url_var.get().strip()
-                output_dir = self.output_dir_var.get().strip() or DEFAULT_OUTPUT_DIR
+                interval_sec = snapshot.get("interval_sec")
+                target_rate = snapshot.get("target_rate")
+                currency_pair = str(snapshot.get("currency_pair", "")).strip()
+                condition = str(snapshot.get("condition", "")).strip()
+                webhook_url = str(snapshot.get("webhook_url", "")).strip()
+                output_dir = str(snapshot.get("output_dir", "")).strip()
 
-                try:
-                    target_rate = float(self.target_rate_var.get().strip())
-                except ValueError:
-                    target_rate = 150.0
+                # 目標レートや監視間隔が不正な場合は勝手にフォールバックせず警告を出してスキップ
+                if (
+                    not isinstance(target_rate, (int, float))
+                    or target_rate <= 0
+                    or not isinstance(interval_sec, int)
+                    or not (MIN_INTERVAL_SEC <= interval_sec <= MAX_INTERVAL_SEC)
+                    or not currency_pair
+                    or not condition
+                    or not output_dir
+                ):
+                    self.append_log(
+                        "[警告] 監視設定（目標レートまたは監視間隔）が不正なため、このサイクルをスキップしました。"
+                    )
+                    wait_sec = (
+                        interval_sec
+                        if isinstance(interval_sec, int) and interval_sec >= MIN_INTERVAL_SEC
+                        else DEFAULT_INTERVAL_SEC
+                    )
+                else:
+                    wait_sec = interval_sec
+                    try:
+                        current_key = (currency_pair, float(target_rate), condition)
+                        if self.last_alert_key != current_key:
+                            self.already_notified = False
+                            self.last_alert_key = current_key
 
-                try:
-                    interval_sec = max(5, int(self.interval_sec_var.get().strip()))
-                except ValueError:
-                    interval_sec = 60
-
-                current_key = (currency_pair, target_rate, condition)
-                if self.last_alert_key != current_key:
-                    self.already_notified = False
-                    self.last_alert_key = current_key
-
-                # 1回分のチェックを実行
-                self._execute_check_cycle(
-                    currency_pair=currency_pair,
-                    target_rate=target_rate,
-                    condition=condition,
-                    webhook_url=webhook_url,
-                    output_dir=output_dir,
-                    is_periodic=True,
-                )
+                        # 1回分のチェックを実行（1回の失敗で監視全体が落ちないよう保護）
+                        self._execute_check_cycle(
+                            currency_pair=currency_pair,
+                            target_rate=float(target_rate),
+                            condition=condition,
+                            webhook_url=webhook_url,
+                            output_dir=output_dir,
+                            is_periodic=True,
+                        )
+                    except Exception as cycle_exc:
+                        self.append_log(
+                            f"[警告] 監視サイクル実行中に予期しないエラーが発生しましたが監視を継続します: {cycle_exc}"
+                        )
 
                 # 次回チェックまでのカウントダウン（0.25秒刻みで停止イベントを監視）
                 start_wait = time.perf_counter()
                 while not self.stop_event.is_set():
                     elapsed = time.perf_counter() - start_wait
-                    remaining = max(0, int(round(interval_sec - elapsed)))
-                    ratio = min(1.0, elapsed / interval_sec) if interval_sec > 0 else 1.0
+                    remaining = max(0, int(round(wait_sec - elapsed)))
+                    ratio = min(1.0, elapsed / wait_sec) if wait_sec > 0 else 1.0
 
                     def _update_timer(r: float = ratio, rem: int = remaining) -> None:
                         if not self.stop_event.is_set():
@@ -1238,7 +1485,7 @@ class RateAlertDashboardApp(ctk.CTk):
 
                     self.after(0, _update_timer)
 
-                    if elapsed >= interval_sec:
+                    if elapsed >= wait_sec:
                         break
                     self.stop_event.wait(0.25)
 
@@ -1263,113 +1510,122 @@ class RateAlertDashboardApp(ctk.CTk):
         output_dir: str,
         is_periodic: bool,
     ) -> None:
-        """為替レートを1回取得し、条件判定・Webhook通知・CSV追記・UI更新を行う。"""
-        try:
-            rate_info = fetch_exchange_rate(
-                currency_pair=currency_pair,
-                timeout=10,
-                max_retries=2,
-                log_callback=self.append_log,
-            )
-        except Exception as exc:
-            self.append_log(f"[エラー] {exc}")
-            if not is_periodic:
-                self.after(
-                    0,
-                    lambda: self.progress_detail_var.set(
-                        "レート取得に失敗しました。通信環境を確認してください。"
-                    ),
+        """
+        為替レートを1回取得し、条件判定・Webhook通知・CSV追記・UI更新を行う。
+        単発取得と定期監視サイクルが同時実行されて重複通知しないよう check_lock で排他制御する。
+        """
+        with self.check_lock:
+            try:
+                rate_info = fetch_exchange_rate(
+                    currency_pair=currency_pair,
+                    timeout=10,
+                    max_retries=2,
+                    log_callback=self.append_log,
                 )
-            return
-
-        current_rate = float(rate_info["rate"])
-        fetched_at = str(rate_info["fetched_at"])
-        is_matched = evaluate_condition(current_rate, target_rate, condition)
-        diff = current_rate - target_rate
-
-        if is_matched:
-            judgment_str = "条件達成！"
-            status_disp = "条件達成！"
-            if self.already_notified:
-                notification_str = "スキップ（通知済）"
-                self.append_log(
-                    f"[警告] {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円: 条件達成継続中のためWebhook通知をスキップ）"
-                )
-            else:
-                if webhook_url:
-                    res = send_webhook_notification(
-                        webhook_url=webhook_url,
-                        currency_pair=currency_pair,
-                        current_rate=current_rate,
-                        target_rate=target_rate,
-                        condition=condition,
-                        is_test=False,
+            except Exception as exc:
+                err_text = str(exc)
+                self.append_log(f"[エラー] {err_text}")
+                self.update_kpi(status_text="通信エラー")
+                if not is_periodic:
+                    self.after(
+                        0,
+                        lambda msg=err_text: self.progress_detail_var.set(msg),
                     )
-                    if res["success"]:
-                        notification_str = f"通知済 ({res['platform']})"
+                return
+
+            current_rate = float(rate_info["rate"])
+            fetched_at = str(rate_info["fetched_at"])
+            is_matched = evaluate_condition(current_rate, target_rate, condition)
+            diff = current_rate - target_rate
+
+            if is_matched:
+                judgment_str = "条件達成！"
+                status_disp = "条件達成！"
+                if self.already_notified:
+                    notification_str = "スキップ（通知済）"
+                    self.append_log(
+                        f"[警告] {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円: 条件達成継続中のためWebhook通知をスキップ）"
+                    )
+                else:
+                    if webhook_url:
+                        res = send_webhook_notification(
+                            webhook_url=webhook_url,
+                            currency_pair=currency_pair,
+                            current_rate=current_rate,
+                            target_rate=target_rate,
+                            condition=condition,
+                            is_test=False,
+                        )
+                        if res["success"]:
+                            notification_str = f"通知済 ({res['platform']})"
+                            self.already_notified = True
+                            self.append_log(
+                                f"[条件達成] {currency_pair} = {current_rate:.2f} 円 （目標比 {diff:+.2f} 円） -> [通知成功] {res['message']}"
+                            )
+                        else:
+                            notification_str = "送信失敗"
+                            self.append_log(
+                                f"[エラー] 条件達成（{current_rate:.2f} 円）ですがWebhook送信に失敗しました: {res['message']}"
+                            )
+                    else:
+                        notification_str = "未送信（URL未設定）"
                         self.already_notified = True
                         self.append_log(
-                            f"[条件達成] {currency_pair} = {current_rate:.2f} 円 （目標比 {diff:+.2f} 円） -> [通知成功] {res['message']}"
+                            f"[条件達成] {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円 / Webhook URL未設定）"
                         )
-                    else:
-                        notification_str = "送信失敗"
-                        self.append_log(
-                            f"[エラー] 条件達成（{current_rate:.2f} 円）ですがWebhook送信に失敗しました: {res['message']}"
-                        )
-                else:
-                    notification_str = "未送信（URL未設定）"
-                    self.already_notified = True
+            else:
+                # 条件未達に戻ったら通知済みフラグをリセット
+                if self.already_notified:
+                    self.already_notified = False
                     self.append_log(
-                        f"[条件達成] {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円 / Webhook URL未設定）"
+                        f"レートが目標範囲外（{current_rate:.2f} 円）に戻ったため、通知済みフラグをリセットしました。"
                     )
-        else:
-            # 条件未達に戻ったら通知済みフラグをリセット
-            if self.already_notified:
-                self.already_notified = False
+                judgment_str = "監視中（未達）"
+                notification_str = "通知なし"
+                status_disp = "自動監視中" if is_periodic else "待機中"
                 self.append_log(
-                    f"レートが目標範囲外（{current_rate:.2f} 円）に戻ったため、通知済みフラグをリセットしました。"
+                    f"取得完了: {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円 / 差 {diff:+.2f} 円 -> 未達）"
                 )
-            judgment_str = "監視中（未達）"
-            notification_str = "通知なし"
-            status_disp = "自動監視中" if is_periodic else "待機中"
-            self.append_log(
-                f"取得完了: {currency_pair} = {current_rate:.2f} 円 （目標 {target_rate:.2f} 円 / 差 {diff:+.2f} 円 -> 未達）"
+
+            # KPIカード更新
+            self.update_kpi(
+                current_rate=current_rate,
+                target_rate=target_rate,
+                status_text=status_disp,
+                is_alert=is_matched,
             )
 
-        # KPIカード更新
-        self.update_kpi(
-            current_rate=current_rate,
-            target_rate=target_rate,
-            status_text=status_disp,
-            is_alert=is_matched,
-        )
+            if not is_periodic:
+                api_update_str = str(rate_info.get("api_last_update", ""))
+                self.after(
+                    0,
+                    lambda f=fetched_at, u=api_update_str: self.progress_detail_var.set(
+                        f"単発取得完了（{f}）— API更新時刻: {u}"
+                    ),
+                )
 
-        if not is_periodic:
-            self.after(
-                0,
-                lambda: self.progress_detail_var.set(
-                    f"単発取得完了（{fetched_at}）— API更新時刻: {rate_info['api_last_update']}"
-                ),
-            )
+            # CSV追記（ロック時の自動退避保存対応）＆ Treeviewプレビュー更新
+            record = {
+                "fetched_at": fetched_at,
+                "currency_pair": currency_pair,
+                "current_rate": f"{current_rate:.2f}",
+                "current_rate_str": f"{current_rate:.2f} 円",
+                "target_rate": f"{target_rate:.2f}",
+                "target_rate_str": f"{target_rate:.2f} 円",
+                "condition": condition,
+                "judgment": judgment_str,
+                "notification": notification_str,
+            }
+            try:
+                append_history_csv(
+                    record,
+                    output_dir=output_dir,
+                    log_callback=self.append_log,
+                )
+            except Exception as exc:
+                self.append_log(f"[エラー] CSV履歴の保存に失敗しました: {exc}")
 
-        # CSV追記 ＆ Treeviewプレビュー更新
-        record = {
-            "fetched_at": fetched_at,
-            "currency_pair": currency_pair,
-            "current_rate": f"{current_rate:.2f}",
-            "current_rate_str": f"{current_rate:.2f} 円",
-            "target_rate": f"{target_rate:.2f}",
-            "target_rate_str": f"{target_rate:.2f} 円",
-            "condition": condition,
-            "judgment": judgment_str,
-            "notification": notification_str,
-        }
-        try:
-            append_history_csv(record, output_dir=output_dir)
-        except Exception as exc:
-            self.append_log(f"[エラー] CSV履歴の保存に失敗しました: {exc}")
-
-        self.insert_history_row(record)
+            self.insert_history_row(record)
 
     def _on_close(self) -> None:
         """ウィンドウ終了時に設定を保存し、監視スレッドを停止して閉じる。"""

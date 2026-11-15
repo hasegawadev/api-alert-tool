@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
+import re
 import time
 from typing import Any, Callable
 import pandas as pd
@@ -21,6 +22,19 @@ HISTORY_COLUMNS = [
     "判定結果",
     "通知状況",
 ]
+
+_URL_PATTERN = re.compile(r"https?://\S+")
+
+
+class RateLimitError(RuntimeError):
+    """HTTP 429 レート制限検知時にリトライせず即時中断するための例外。"""
+
+
+def mask_urls(text: str) -> str:
+    """エラーメッセージ等に含まれる http:// または https:// URL を [MASKED_URL] に置換する。"""
+    if not text:
+        return ""
+    return _URL_PATTERN.sub("[MASKED_URL]", str(text))
 
 
 def parse_currency_pair(currency_pair: str) -> tuple[str, str]:
@@ -43,10 +57,11 @@ def fetch_exchange_rate(
 ) -> dict[str, Any]:
     """
     ExchangeRate-API (https://open.er-api.com/v6/latest/{base_currency}) から
-    指定した通貨ペアの最新為替レートを取得する。
+    指定した通貨ペアの為替レートを取得する。
 
     - タイムアウト: デフォルト10秒
-    - 通信エラー時は最大 max_retries 回（デフォルト2回）リトライする。
+    - HTTP 429 (レート制限) の場合はリトライを行わず即座にエラーを返す。
+    - その他の通信エラー時は最大 max_retries 回（デフォルト2回）リトライする。
     - 戻り値:
         {
             "currency_pair": "USD/JPY",
@@ -66,6 +81,10 @@ def fetch_exchange_rate(
     for attempt in range(1, total_attempts + 1):
         try:
             response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+            if response.status_code == 429:
+                raise RateLimitError(
+                    "レート制限（HTTP 429）を検知しました。約20分後に再試行してください。"
+                )
             response.raise_for_status()
             data = response.json()
 
@@ -98,19 +117,23 @@ def fetch_exchange_rate(
                 "fetched_at": fetched_at,
             }
 
+        except RateLimitError:
+            # HTTP 429 の場合はリトライせず即時送出
+            raise
         except Exception as exc:
             last_error = exc
+            masked_err = mask_urls(str(exc))
             if attempt <= max_retries:
                 if log_callback:
                     log_callback(
-                        f"[警告] API通信失敗（試行 {attempt}/{total_attempts}）: {exc} -> リトライします..."
+                        f"[警告] API通信失敗（試行 {attempt}/{total_attempts}）: {masked_err} -> リトライします..."
                     )
                 time.sleep(1.5 * attempt)
             else:
                 break
 
     raise RuntimeError(
-        f"為替レートの取得に失敗しました（全{total_attempts}回試行）: {last_error}"
+        f"為替レートの取得に失敗しました（全{total_attempts}回試行）: {mask_urls(str(last_error))}"
     ) from last_error
 
 
@@ -149,6 +172,7 @@ def send_webhook_notification(
 ) -> dict[str, Any]:
     """
     Discord または Slack の Incoming Webhook に通知メッセージをPOST送信する。
+    通信例外やエラー応答に含まれる URL は [MASKED_URL] にマスクして秘密トークン漏洩を防止する。
 
     - Discord URL ('discord.com/api/webhooks/...' または 'discordapp.com'): {"content": message}
     - Slack URL ('hooks.slack.com/...'): {"text": message}
@@ -231,18 +255,20 @@ def send_webhook_notification(
                 "status_code": response.status_code,
                 "message": f"{platform_label} へ{kind_str}を送信しました（HTTP {response.status_code}）",
             }
+        masked_body = mask_urls(response.text[:120])
         return {
             "success": False,
             "platform": platform_label,
             "status_code": response.status_code,
-            "message": f"{platform_label} 送信失敗（HTTP {response.status_code}）: {response.text[:120]}",
+            "message": f"{platform_label} 送信失敗（HTTP {response.status_code}）: {masked_body}",
         }
     except Exception as exc:
+        masked_exc = mask_urls(str(exc))
         return {
             "success": False,
             "platform": platform_label,
             "status_code": None,
-            "message": f"{platform_label} への通信エラー: {exc}",
+            "message": f"{platform_label} への通信エラー: {masked_exc}",
         }
 
 
@@ -250,18 +276,12 @@ def append_history_csv(
     record: dict[str, Any],
     output_dir: str,
     filename: str = "rate_history.csv",
+    log_callback: Callable[[str], None] | None = None,
 ) -> str:
     """
     指定フォルダ内の rate_history.csv に履歴1件を UTF-8 (BOM付き utf-8-sig) で追記保存する。
-
-    record の想定キー:
-        - fetched_at (または 取得日時)
-        - currency_pair (または 通貨ペア)
-        - current_rate (または 現在レート)
-        - target_rate (または 目標レート)
-        - condition (または 判定条件)
-        - judgment (または 判定結果)
-        - notification (または 通知状況)
+    Excel等でファイルが開かれていて PermissionError となった場合は、
+    同フォルダ内に rate_history_backup_YYYYMMDD_HHMMSS.csv として退避保存する。
     """
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, filename)
@@ -283,14 +303,31 @@ def append_history_csv(
     df = pd.DataFrame([row_data], columns=HISTORY_COLUMNS)
     file_exists = os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0
 
-    df.to_csv(
-        csv_path,
-        mode="a",
-        header=not file_exists,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    return csv_path
+    try:
+        df.to_csv(
+            csv_path,
+            mode="a",
+            header=not file_exists,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        return csv_path
+    except PermissionError:
+        backup_name = f"rate_history_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        backup_path = os.path.join(output_dir, backup_name)
+        backup_exists = os.path.isfile(backup_path) and os.path.getsize(backup_path) > 0
+        df.to_csv(
+            backup_path,
+            mode="a",
+            header=not backup_exists,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        if log_callback:
+            log_callback(
+                f"[警告] {filename} がExcel等で開かれていて書き込めないため、{backup_name} に退避保存しました。"
+            )
+        return backup_path
 
 
 def load_history_csv(
