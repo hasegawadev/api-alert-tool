@@ -171,11 +171,11 @@ def send_webhook_notification(
     timeout: int = 10,
 ) -> dict[str, Any]:
     """
-    Discord または Slack の Incoming Webhook に通知メッセージをPOST送信する。
+    Discord または Slack の Incoming Webhook にリッチカード形式（Embeds / Attachments）で通知をPOST送信する。
     通信例外やエラー応答に含まれる URL は [MASKED_URL] にマスクして秘密トークン漏洩を防止する。
 
-    - Discord URL ('discord.com/api/webhooks/...' または 'discordapp.com'): {"content": message}
-    - Slack URL ('hooks.slack.com/...'): {"text": message}
+    - Discord URL ('discord.com/api/webhooks/...' または 'discordapp.com'): {"embeds": [...]}
+    - Slack URL ('hooks.slack.com/...'): {"attachments": [...]}
     - 戻り値:
         {
             "success": bool,
@@ -214,31 +214,102 @@ def send_webhook_notification(
     diff_str = f"{diff:+.4f}" if not unit else f"{diff:+.2f} {unit}"
     rate_str = f"{current_rate:.4f}" if not unit else f"{current_rate:.2f} {unit}"
     target_str = f"{target_rate:.4f}" if not unit else f"{target_rate:.2f} {unit}"
+    target_cond_str = f"{target_str} ({condition})"
+    footer_text = f"検知日時: {now_str} | Rates By Exchange Rate API"
 
-    if custom_message:
-        body_text = custom_message
-    elif is_test:
-        body_text = (
-            f"🔔 **【テスト通知】為替レート監視 ＆ Webhook自動通知ダッシュボード**\n"
-            f"・送信日時: `{now_str}`\n"
-            f"・送信先判定: `{platform_label}`\n"
-            f"・設定中の監視条件: `{currency_pair}` が `{target_str}` （{condition}）\n"
-            f"Webhook連携は正常に機能しています！"
+    if is_test:
+        card_title = "🔔 【テスト通知】為替レート監視 ＆ Webhook自動通知ダッシュボード"
+        card_desc = (
+            custom_message
+            if custom_message
+            else "Webhook連携は正常に機能しています！条件達成時にこのカード形式で通知が届きます。"
         )
+        discord_color = 0x3B82F6
+        slack_color = "#3B82F6"
+        rate_disp_discord = f"`{rate_str}` (テスト値)"
+        rate_disp_slack = f"{rate_str} (テスト値)"
     else:
-        body_text = (
-            f"🚨 **【為替アラート条件達成】 {currency_pair} が目標レートに到達しました！**\n"
-            f"・検知日時: `{now_str}`\n"
-            f"・通貨ペア: `{currency_pair}`\n"
-            f"・現在レート: **{rate_str}** （目標比: `{diff_str}`）\n"
-            f"・設定条件: `{target_str}` （{condition}）"
+        card_title = f"🚨 【為替アラート条件達成】 {currency_pair} が目標レートに到達しました！"
+        card_desc = (
+            custom_message
+            if custom_message
+            else f"設定した監視条件（{target_cond_str}）を満たしたため自動通知しました。"
         )
+        discord_color = 0x10B981
+        slack_color = "#10B981"
+        rate_disp_discord = f"**{rate_str}**"
+        rate_disp_slack = rate_str
 
     if platform_key == "discord":
-        payload = {"content": body_text}
+        payload: dict[str, Any] = {
+            "embeds": [
+                {
+                    "title": card_title,
+                    "description": card_desc,
+                    "color": discord_color,
+                    "fields": [
+                        {
+                            "name": "通貨ペア",
+                            "value": f"`{currency_pair}`",
+                            "inline": True,
+                        },
+                        {
+                            "name": "現在レート",
+                            "value": rate_disp_discord,
+                            "inline": True,
+                        },
+                        {
+                            "name": "目標レート（条件）",
+                            "value": f"`{target_cond_str}`",
+                            "inline": True,
+                        },
+                        {
+                            "name": "目標比",
+                            "value": f"`{diff_str}`",
+                            "inline": True,
+                        },
+                    ],
+                    "footer": {
+                        "text": footer_text,
+                    },
+                }
+            ]
+        }
     else:
-        # Slack および一般的な Incoming Webhook 互換形式
-        payload = {"text": body_text}
+        # Slack および一般的な Incoming Webhook 互換のリッチカード（attachments）形式
+        payload = {
+            "attachments": [
+                {
+                    "fallback": f"{card_title} - {currency_pair}: {rate_str} (目標: {target_cond_str})",
+                    "color": slack_color,
+                    "title": card_title,
+                    "text": card_desc,
+                    "fields": [
+                        {
+                            "title": "通貨ペア",
+                            "value": currency_pair,
+                            "short": True,
+                        },
+                        {
+                            "title": "現在レート",
+                            "value": rate_disp_slack,
+                            "short": True,
+                        },
+                        {
+                            "title": "目標レート（条件）",
+                            "value": target_cond_str,
+                            "short": True,
+                        },
+                        {
+                            "title": "目標比",
+                            "value": diff_str,
+                            "short": True,
+                        },
+                    ],
+                    "footer": footer_text,
+                }
+            ]
+        }
 
     try:
         response = requests.post(
