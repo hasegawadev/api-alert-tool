@@ -890,13 +890,18 @@ class RateAlertDashboardApp(ctk.CTk):
     def show_webhook_help_dialog(self) -> None:
         """Discord / Slack の Webhook URL 発行手順（3ステップ）をポップアップダイアログで表示する。"""
         if self.help_dialog is not None and self.help_dialog.winfo_exists():
+            self.help_dialog.deiconify()
             self.help_dialog.focus_force()
             self.help_dialog.lift()
             return
 
+        # 1. ポップアップ生成前に親ウィンドウの正確な座標・サイズを取得
+        self.update_idletasks()
+        dlg_w, dlg_h = 560, 420
+
         dlg = ctk.CTkToplevel(self)
+        dlg.withdraw()
         dlg.title("Webhook URL の取得方法（Discord / Slack）")
-        dlg.geometry("560x420")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.configure(fg_color=COLOR_BG)
@@ -993,6 +998,28 @@ class RateAlertDashboardApp(ctk.CTk):
             text_color="#FFFFFF",
             command=dlg.destroy,
         ).pack(pady=(2, 14))
+
+        # 2. ポップアップ側の update_idletasks() も呼んだうえで中央座標を算出し、遅延再適用も併用
+        def _center_on_parent() -> None:
+            if not dlg.winfo_exists():
+                return
+            self.update_idletasks()
+            dlg.update_idletasks()
+            parent_x = self.winfo_rootx()
+            parent_y = self.winfo_rooty()
+            parent_w = self.winfo_width()
+            parent_h = self.winfo_height()
+            scaled_w = int(dlg._apply_window_scaling(dlg_w))
+            scaled_h = int(dlg._apply_window_scaling(dlg_h))
+            pos_x = max(0, parent_x + (parent_w - scaled_w) // 2)
+            pos_y = max(0, parent_y + (parent_h - scaled_h) // 2)
+            dlg.geometry(f"{dlg_w}x{dlg_h}+{pos_x}+{pos_y}")
+            dlg.deiconify()
+            dlg.lift()
+            dlg.focus_force()
+
+        _center_on_parent()
+        dlg.after(50, _center_on_parent)
 
     def _toggle_webhook_visibility(self) -> None:
         """Webhook URL入力欄の伏字（•）と平文表示を切り替える。"""
